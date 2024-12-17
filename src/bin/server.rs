@@ -1,8 +1,12 @@
 use failure::Error;
+use std::borrow::BorrowMut;
 use std::collections::VecDeque;
-use std::io::prelude::*;
+use std::io::{prelude::*, BufReader, BufWriter};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tracing::info;
+use tracing_subscriber::fmt;
 
 // type Queue<Work> = Arc<Mutex<VecDeque<Work>>>;
 
@@ -11,26 +15,44 @@ use std::sync::{Arc, Mutex};
 // to the client
 
 fn handle_client(stream: &mut TcpStream) -> Result<(), Error> {
-    let mut bytes = stream.bytes();
-    let d = redis_rust::redis::parse_redis_request(&mut bytes)?;
-    println!("Finished request");
-    let command = redis_rust::redis::into_command(d)?;
-    match command {
-        redis_rust::redis::Command::Ping => {
-            println!("Returning PONG");
-            stream.write("PONG\r\n".as_bytes())?;
+    info!("Handling client");
+    // create a buffered reader / writer
+    // for the tcp stream
+    let mut write_stream = BufWriter::new(stream.try_clone()?);
+    // set a read timeout so we don't wait forever
+    stream.set_read_timeout(Some(Duration::from_millis(10)))?;
+    let mut bufreader = BufReader::new(stream);
+    // while there's data in the buffer
+    loop {
+        info!("Checking has data left");
+        let has_data_left = bufreader.fill_buf()?;
+        if has_data_left.is_empty() {
+            break;
         }
-        redis_rust::redis::Command::Echo(e) => {
-            // TODO:
+
+        // parse more commands
+        info!("Calling parse");
+        let d = redis_rust::redis::parse_redis_datatype(&mut bufreader.borrow_mut().bytes())?;
+        let command = redis_rust::redis::into_command(&d)?;
+        match command {
+            redis_rust::redis::Command::Ping => {
+                println!("Returning PONG");
+                write_stream.write("$4\r\nPONG\r\n".as_bytes())?;
+                write_stream.flush()?;
+            }
+            redis_rust::redis::Command::Echo(e) => {}
         }
     }
+
+    // TODO:
 
     Ok(())
 }
 
 pub fn main() -> std::io::Result<()> {
-    println!("starting server");
-    let listener = TcpListener::bind("127.0.0.1:3456")?;
+    fmt::init();
+    info!("Starting server");
+    let listener = TcpListener::bind("127.0.0.1:6379")?;
     for stream in listener.incoming() {
         let err = handle_client(&mut stream?);
         if err.is_err() {
