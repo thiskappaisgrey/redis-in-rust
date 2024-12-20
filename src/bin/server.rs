@@ -1,12 +1,12 @@
 use anyhow::Error;
+use futures::executor;
+use redis_rust::executor::new_executor_and_spawner;
 use redis_rust::redis::ReadBufLine;
-use std::borrow::BorrowMut;
-use std::collections::VecDeque;
 use std::io::{prelude::*, BufReader, BufWriter};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
-use tracing::{info, span, Level};
+use tracing::{error, info, span, Instrument, Level};
 use tracing_subscriber::fmt;
 
 // type Queue<Work> = Arc<Mutex<VecDeque<Work>>>;
@@ -16,7 +16,7 @@ use tracing_subscriber::fmt;
 // to the client
 //
 // TODO: how do I handle concurrent clients..? just have a custom executor!
-fn handle_client(stream: &mut TcpStream) -> Result<(), Error> {
+async fn handle_client(stream: &mut TcpStream) -> Result<(), Error> {
     let span = span!(Level::INFO, "handle_client");
     let _enter = span.enter();
     // create a buffered reader / writer
@@ -29,16 +29,15 @@ fn handle_client(stream: &mut TcpStream) -> Result<(), Error> {
     // while there's data in the buffer
     loop {
         info!("Checking has data left");
-        let has_data_left = readbufline.has_data()?;
-        if has_data_left {
+        if readbufline.is_empty().await? {
+            info!("Task ended");
             break;
         }
-
         // parse more commands
         info!("Calling parse");
         // TODO: we have to poll this until completion
         // I wonder what completion means ..
-        let d = redis_rust::redis::parse_redis_datatype_sync(&mut readbufline)?;
+        let d = redis_rust::redis::parse_redis_datatype(&mut readbufline).await?;
         let command = redis_rust::redis::into_command(&d)?;
         match command {
             redis_rust::redis::Command::Ping => {
@@ -49,8 +48,7 @@ fn handle_client(stream: &mut TcpStream) -> Result<(), Error> {
         }
     }
 
-    // TODO:
-
+    info!("Task ended");
     Ok(())
 }
 
@@ -58,13 +56,32 @@ pub fn main() -> std::io::Result<()> {
     fmt::init();
     info!("Starting server");
     let listener = TcpListener::bind("127.0.0.1:6379")?;
+    let (executor, spawner) = new_executor_and_spawner();
+    // spapwn the executor in another thread
+    thread::spawn(move || {
+        executor.run();
+    });
+    let mut counter = 0;
     for stream in listener.incoming() {
+        let task_id = counter;
+        counter += 1;
         // TODO: for concurrent
-        let err = handle_client(&mut stream?);
-        if err.is_err() {
-            let e = err.err().unwrap();
-            eprintln!("Handle client encountered error: {}", e);
-        }
+        spawner.spawn(async move {
+            let span = span!(Level::INFO, "task", value = task_id);
+            async move {
+                info!("Spawning tasks_{task_id}");
+                let mut s = stream.unwrap();
+                let err = handle_client(&mut s).await;
+                if err.is_err() {
+                    let e = err.err().unwrap();
+                    error!("Handle client encountered error: {}", e);
+                }
+            }
+            .instrument(span)
+            .await;
+
+            ()
+        });
     }
 
     Ok(())

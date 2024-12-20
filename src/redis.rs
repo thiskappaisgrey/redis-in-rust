@@ -7,6 +7,7 @@ use std::{
     pin::{self, Pin},
     ptr,
     rc::Rc,
+    sync::Arc,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 use tracing::info;
@@ -18,8 +19,8 @@ pub enum DataTypes {
     // have the same representation
     //
     // TODO: if the string doesn't require mutation .. use a different type instead..?
-    String(Rc<str>),
-    ErrorMessage(Rc<str>),
+    String(Arc<str>),
+    ErrorMessage(Arc<str>),
     Int(i64),
     Array(Vec<DataTypes>),
     NullArray,
@@ -32,13 +33,42 @@ pub enum DataTypes {
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Ping,
-    Echo(Rc<str>), // TODO: prob want to use a better type here..
+    Echo(Arc<str>), // TODO: prob want to use a better type here..
 }
 
 pub struct ReadBufLine<T: BufRead> {
     bufread: T,
     buf: Vec<u8>, // a buffer for partially read data
 }
+
+// this is not thread safe though..
+pub struct IsEmpty<'a> {
+    bufread: &'a mut dyn BufRead,
+}
+
+unsafe impl<'a> Send for IsEmpty<'a> {}
+
+impl<'a> Future for IsEmpty<'a> {
+    type Output = Result<bool, Error>;
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let r = Pin::into_inner(self).bufread.fill_buf();
+        match r {
+            Ok(v) => {
+                info!("is empty returned buffer");
+                return Poll::Ready(Ok(v.len() == 0));
+            }
+            Err(k) => {
+                if k.kind() == io::ErrorKind::WouldBlock {
+                    info!("is empty returned would block");
+                    return Poll::Pending;
+                } else {
+                    return Poll::Ready(Err(k.into()));
+                }
+            }
+        }
+    }
+}
+
 impl<T: BufRead> ReadBufLine<T> {
     pub fn new(b: T) -> ReadBufLine<T>
     where
@@ -50,9 +80,11 @@ impl<T: BufRead> ReadBufLine<T> {
         };
     }
 
-    pub fn has_data(&mut self) -> Result<bool, Error> {
-        let has_data_left = self.bufread.fill_buf()?;
-        return Ok(has_data_left.is_empty());
+    // is empty should really be a new future..
+    pub fn is_empty(&mut self) -> IsEmpty {
+        IsEmpty {
+            bufread: &mut self.bufread,
+        }
     }
 }
 
@@ -90,6 +122,7 @@ impl<T: BufRead> Future for ReadBufLine<T> {
                 // but it works ;)
                 let mut buf: Vec<u8> = this.buf.clone();
                 if buf.first() == Some(&b'\n') {
+                    info!("Removing newline");
                     buf.remove(0);
                 }
                 buf.pop();
@@ -97,6 +130,7 @@ impl<T: BufRead> Future for ReadBufLine<T> {
                 return std::task::Poll::Ready(Ok(buf));
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                info!("Linebuf returned wouldblock");
                 return std::task::Poll::Pending;
             }
             Err(e) => {
@@ -112,10 +146,11 @@ impl<T: BufRead> Future for ReadBufLine<T> {
 // So .. maybe we can make an iterator over this data..?
 // I guess .. the input would be better served as "lines of bytes"
 // instead of just plain bytes
-//
 
 // line_getter is a "future" that I explicitly await on
 // .. basically this is kinda like an iterator
+//
+// This is hard .. b/c I'm not sure what the right abstraction is..
 pub async fn parse_redis_datatype<T>(line_getter: &mut ReadBufLine<T>) -> Result<DataTypes, Error>
 where
     T: BufRead,
@@ -125,7 +160,9 @@ where
     // more meaningful
     //
     // read the first byte to see what type it is
+    info!("Awaiting");
     let mut bytes = line_getter.borrow_mut().await?;
+    info!("Got line: {}.", String::from_utf8(bytes.clone()).unwrap());
     if bytes.first().is_none() {
         return Err(format_err!("Missing specifier"));
     }

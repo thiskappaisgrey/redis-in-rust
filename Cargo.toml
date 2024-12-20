@@ -9,5 +9,6 @@ test = false
 
 [dependencies]
 anyhow = "1.0.94"
+futures = "0.3.31"
 tracing = "0.1.41"
 tracing-subscriber = { version= "0.3.19", features = ["fmt", "registry", "std"]}
