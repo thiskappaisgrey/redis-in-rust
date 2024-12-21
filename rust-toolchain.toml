@@ -1,0 +1,5 @@
+[toolchain]
+# using nightly because miri can only run on nightly
+channel = "nightly"
+components = ["rustfmt", "clippy", "rust-src", "miri", "rust-analyzer"]
+targets = []

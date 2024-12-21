@@ -1,9 +1,11 @@
 use anyhow::Error;
-use futures::executor;
+use futures::io::{BufReader, BufWriter};
+use futures::{executor, AsyncWriteExt};
 use redis_rust::executor::new_executor_and_spawner;
-use redis_rust::redis::ReadBufLine;
-use std::io::{prelude::*, BufReader, BufWriter};
+use redis_rust::reactor;
+use redis_rust::redis::RedisParser;
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::fd::AsFd;
 use std::thread;
 use std::time::Duration;
 use tracing::{error, info, span, Instrument, Level};
@@ -16,33 +18,28 @@ use tracing_subscriber::fmt;
 // to the client
 //
 // TODO: how do I handle concurrent clients..? just have a custom executor!
-async fn handle_client(stream: &mut TcpStream) -> Result<(), Error> {
+async fn handle_client(stream: TcpStream) -> Result<(), Error> {
+    let read_stream = redis_rust::futures::AsyncTCPStream::new(stream.try_clone().unwrap())?;
+    let write_stream = redis_rust::futures::AsyncTCPStream::new(stream)?;
     let span = span!(Level::INFO, "handle_client");
     let _enter = span.enter();
-    // create a buffered reader / writer
-    // for the tcp stream
-    let mut write_stream = BufWriter::new(stream.try_clone()?);
-    // set a read timeout so we don't wait forever
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-    let bufreader = BufReader::new(stream);
-    let mut readbufline = ReadBufLine::new(bufreader);
+    let mut write_stream = BufWriter::new(write_stream);
+    let bufreader = BufReader::new(read_stream);
+    let mut parser = RedisParser::new(bufreader);
     // while there's data in the buffer
     loop {
-        info!("Checking has data left");
-        if readbufline.is_empty().await? {
-            info!("Task ended");
-            break;
-        }
-        // parse more commands
-        info!("Calling parse");
-        // TODO: we have to poll this until completion
-        // I wonder what completion means ..
-        let d = redis_rust::redis::parse_redis_datatype(&mut readbufline).await?;
-        let command = redis_rust::redis::into_command(&d)?;
+        let r = parser.parse().await?;
+        let command = redis_rust::redis::into_command(&r)?;
+        //     // parse more commands
+        //     info!("Calling parse");
+        //     // TODO: we have to poll this until completion
+        //     // I wonder what completion means ..
+        //     // let d = redis_rust::redis::parse_redis_datatype(&mut readbufline).await?;
+        //     //
         match command {
             redis_rust::redis::Command::Ping => {
-                write_stream.write("$4\r\nPONG\r\n".as_bytes())?;
-                write_stream.flush()?;
+                write_stream.write_all("$4\r\nPONG\r\n".as_bytes()).await;
+                write_stream.flush().await?;
             }
             redis_rust::redis::Command::Echo(e) => {}
         }
@@ -54,6 +51,10 @@ async fn handle_client(stream: &mut TcpStream) -> Result<(), Error> {
 
 pub fn main() -> std::io::Result<()> {
     fmt::init();
+    // setup and run the reactor
+    reactor::Reactor::setup().unwrap();
+    reactor::Reactor::set_up_event_loop();
+
     info!("Starting server");
     let listener = TcpListener::bind("127.0.0.1:6379")?;
     let (executor, spawner) = new_executor_and_spawner();
@@ -61,17 +62,15 @@ pub fn main() -> std::io::Result<()> {
     thread::spawn(move || {
         executor.run();
     });
-    let mut counter = 0;
-    for stream in listener.incoming() {
+    for (counter, stream) in listener.incoming().enumerate() {
         let task_id = counter;
-        counter += 1;
+        let span = span!(Level::INFO, "task", value = task_id);
         // TODO: for concurrent
         spawner.spawn(async move {
-            let span = span!(Level::INFO, "task", value = task_id);
             async move {
                 info!("Spawning tasks_{task_id}");
-                let mut s = stream.unwrap();
-                let err = handle_client(&mut s).await;
+                let s = stream.unwrap();
+                let err = handle_client(s).await;
                 if err.is_err() {
                     let e = err.err().unwrap();
                     error!("Handle client encountered error: {}", e);
@@ -79,8 +78,6 @@ pub fn main() -> std::io::Result<()> {
             }
             .instrument(span)
             .await;
-
-            ()
         });
     }
 

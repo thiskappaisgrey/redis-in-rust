@@ -1,9 +1,11 @@
 use anyhow::{format_err, Error};
+use futures::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 use std::{
     borrow::{Borrow, BorrowMut},
     fmt::Debug,
     future::{Future, Ready},
     io::{self, BufRead, BufReader, Bytes, Write},
+    os::fd::{AsFd, BorrowedFd},
     pin::{self, Pin},
     ptr,
     rc::Rc,
@@ -11,6 +13,8 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 use tracing::info;
+
+use crate::reactor::reactor;
 
 // TODO: I will probably have to end up giving lifetime params here
 #[derive(Debug, PartialEq)]
@@ -36,58 +40,6 @@ pub enum Command {
     Echo(Arc<str>), // TODO: prob want to use a better type here..
 }
 
-pub struct ReadBufLine<T: BufRead> {
-    bufread: T,
-    buf: Vec<u8>, // a buffer for partially read data
-}
-
-// this is not thread safe though..
-pub struct IsEmpty<'a> {
-    bufread: &'a mut dyn BufRead,
-}
-
-unsafe impl<'a> Send for IsEmpty<'a> {}
-
-impl<'a> Future for IsEmpty<'a> {
-    type Output = Result<bool, Error>;
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let r = Pin::into_inner(self).bufread.fill_buf();
-        match r {
-            Ok(v) => {
-                info!("is empty returned buffer");
-                return Poll::Ready(Ok(v.len() == 0));
-            }
-            Err(k) => {
-                if k.kind() == io::ErrorKind::WouldBlock {
-                    info!("is empty returned would block");
-                    return Poll::Pending;
-                } else {
-                    return Poll::Ready(Err(k.into()));
-                }
-            }
-        }
-    }
-}
-
-impl<T: BufRead> ReadBufLine<T> {
-    pub fn new(b: T) -> ReadBufLine<T>
-    where
-        T: BufRead,
-    {
-        return ReadBufLine {
-            bufread: b,
-            buf: Vec::new(),
-        };
-    }
-
-    // is empty should really be a new future..
-    pub fn is_empty(&mut self) -> IsEmpty {
-        IsEmpty {
-            bufread: &mut self.bufread,
-        }
-    }
-}
-
 // NOOP waker from the stdlib unstable feature
 const NOOP: RawWaker = {
     const VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -104,131 +56,95 @@ const NOOP: RawWaker = {
 };
 // create a readbufline from a bufread
 
-impl<T: BufRead> Unpin for ReadBufLine<T> {}
+pub struct RedisParser<T: AsyncBufRead + Unpin> {
+    buf: Vec<u8>, // A buffer allocated once to reuse through out the entire parse
+    bufread: T,   // the buffer to read from
+}
 
-impl<T: BufRead> Future for ReadBufLine<T> {
-    type Output = Result<Vec<u8>, Error>;
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        // poll should
-        let this = Pin::into_inner(self);
-        let bufread = this.bufread.read_until(b'\r', &mut this.buf);
-        match bufread {
-            Ok(_n) => {
-                // if this char is a newline .. ignore it
-                // FIXME: this is a terrible implemetation b/c of allocation
-                // but it works ;)
-                let mut buf: Vec<u8> = this.buf.clone();
-                if buf.first() == Some(&b'\n') {
-                    info!("Removing newline");
-                    buf.remove(0);
+impl<T: AsyncBufRead + Unpin> RedisParser<T> {
+    pub fn new(bufread: T) -> Self {
+        Self {
+            buf: Vec::new(),
+            bufread,
+        }
+    }
+    // we can have async methods in traits!
+    pub async fn parse(&mut self) -> Result<DataTypes, Error> {
+        // clear the buffer before each parse
+        self.buf.clear();
+
+        let _s = self.bufread.read_until(b'\r', &mut self.buf).await?;
+        self.buf.pop(); // pop the b'\r' b/c we want inclusive
+
+        let utf8 = std::str::from_utf8(self.buf.as_slice())?;
+        let mut bytes_iter = self.buf.iter();
+        if let Some(b'\n') = bytes_iter.clone().peekable().peek() {
+            bytes_iter.next();
+        }
+
+        // TODO: if I just have a special error type here..
+        let first = bytes_iter.next().ok_or(format_err!("No first byte"))?;
+
+        match first {
+            b'+' => {
+                let s: &[u8] = bytes_iter.as_slice();
+                let utf8 = std::str::from_utf8(s)?;
+                Ok(DataTypes::String(utf8.into()))
+            }
+            b':' => {
+                let x = bytes_iter.as_slice();
+                let utf8 = std::str::from_utf8(x)?;
+                println!("Utf8 is: {}.", utf8);
+                let num = str::parse(utf8).map_err(|_e| format_err!("invalid digit: {}", utf8))?;
+                Ok(DataTypes::Int(num))
+            }
+            b'$' => {
+                let len_str = std::str::from_utf8(bytes_iter.as_slice())?;
+                let len = str::parse(len_str)?;
+                // read the extra newline byte
+                let _s = self.bufread.read_until(b'\n', &mut self.buf).await?;
+
+                // clear the vector
+                self.buf.clear();
+                self.buf.resize(len, 0);
+
+                // read into the buffer the length of the buffer
+                self.bufread.read_exact(&mut self.buf).await?;
+                let utf8 = std::str::from_utf8(&self.buf)?.into();
+                let mut buf = [0; 2];
+                let e = self.bufread.read_exact(&mut buf).await;
+                if let Err(er) = e {
+                    // try to read the \r\n
+                    // but we aren't concernted
+                    if er.kind() != io::ErrorKind::UnexpectedEof {
+                        return Err(er.into());
+                    }
                 }
-                buf.pop();
-                this.buf = Vec::new();
-                return std::task::Poll::Ready(Ok(buf));
+
+                Ok(DataTypes::String(utf8))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                info!("Linebuf returned wouldblock");
-                return std::task::Poll::Pending;
+            b'*' => {
+                println!("Array");
+                let len_str = std::str::from_utf8(&bytes_iter.as_slice())?;
+                println!("utf8: {len_str}");
+                let len = u64::from_str_radix(&len_str, 10)
+                    .map_err(|_e| format_err!("Invalid digit: {len_str}."))?;
+                // Allocate a new datatype vector for the array
+                let mut v = Vec::with_capacity(len as usize);
+
+                for _ in 0..len {
+                    let d = Box::pin(self.parse()).await?;
+                    println!("parsed: {d:?}");
+                    v.push(d);
+                }
+                Ok(DataTypes::Array(v))
             }
-            Err(e) => {
-                return std::task::Poll::Ready(Err(e.into()));
-            }
+            b => Err(format_err!("Invalid datatype specifier: {}", *b as char)),
         }
     }
 }
 
 /// Handles a redis request by iterating over the bytes, consuming the iterator
-// TODO: when parsing a redis_datatype ..
-// we need to make this "resumable" in case somethng blocks
-// So .. maybe we can make an iterator over this data..?
-// I guess .. the input would be better served as "lines of bytes"
-// instead of just plain bytes
-
-// line_getter is a "future" that I explicitly await on
-// .. basically this is kinda like an iterator
-//
-// This is hard .. b/c I'm not sure what the right abstraction is..
-pub async fn parse_redis_datatype<T>(line_getter: &mut ReadBufLine<T>) -> Result<DataTypes, Error>
-where
-    T: BufRead,
-    T: Debug,
-{
-    // TODO: we should attach context to these errors and make them
-    // more meaningful
-    //
-    // read the first byte to see what type it is
-    info!("Awaiting");
-    let mut bytes = line_getter.borrow_mut().await?;
-    info!("Got line: {}.", String::from_utf8(bytes.clone()).unwrap());
-    if bytes.first().is_none() {
-        return Err(format_err!("Missing specifier"));
-    }
-    // this is so inefficient lol
-    let first = bytes.remove(0);
-
-    let r = match first {
-        b'+' => {
-            let utf8 = String::from_utf8(bytes)?;
-            Ok(DataTypes::String(utf8.into()))
-        }
-        b':' => {
-            let x = bytes;
-            let utf8 = std::str::from_utf8(&x)?;
-            let num = i64::from_str_radix(&utf8, 10)
-                .map_err(|_e| format_err!("invalid digit: {}", utf8))?;
-            Ok(DataTypes::Int(num))
-        }
-        b'$' => {
-            let len_str = std::str::from_utf8(&bytes)?;
-            let len = usize::from_str_radix(len_str, 10)?;
-            let mut str = line_getter.borrow_mut().await?;
-            while str.len() < len {
-                str.append(&mut line_getter.borrow_mut().await?);
-            }
-            let utf8 = String::from_utf8(str)?.into();
-            Ok(DataTypes::String(utf8))
-        }
-        b'*' => {
-            let len_bytes = bytes;
-            let len_str = String::from_utf8(len_bytes)?;
-            let len = u64::from_str_radix(&len_str, 10)
-                .map_err(|_e| format_err!("Invalid digit: {len_str}"))?;
-            let mut v = Vec::with_capacity(len as usize);
-
-            for _ in 0..len {
-                let d = Box::pin(parse_redis_datatype(line_getter)).await?;
-                v.push(d);
-            }
-            Ok(DataTypes::Array(v))
-        }
-        b => Err(format_err!("Invalid datatype specifier: {}", b as char)),
-    };
-    r
-}
-pub fn parse_redis_datatype_sync<T>(bytes: &mut ReadBufLine<T>) -> Result<DataTypes, Error>
-where
-    T: io::BufRead,
-    T: Debug,
-{
-    let mut r = pin::pin!(parse_redis_datatype(bytes));
-    let waker = unsafe { Waker::from_raw(NOOP) };
-    let mut cx = Context::from_waker(&waker);
-    // poll until future's ready
-    loop {
-        match r.as_mut().poll(&mut cx) {
-            Poll::Ready(r) => {
-                return r;
-            }
-            Poll::Pending => {
-                info!("pending");
-            }
-        }
-    }
-}
-
 pub fn into_command(d: &DataTypes) -> Result<Command, Error> {
     match d {
         DataTypes::Array(v) => {
@@ -267,122 +183,90 @@ where
 
 #[cfg(test)]
 mod test {
+    use futures::{future::Ready, io::Cursor, FutureExt};
     use std::{
         pin, ptr,
         task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     };
 
-    use io::Read;
-
     use super::*;
-    #[test]
-    fn test_future() {
-        // TODO: I wonder if I can mock the read trait here.
-        let b: &[u8] = b"12345\r\n6789\r\n";
-        let mut line_buf_read: Pin<&mut ReadBufLine<&[u8]>> = pin::pin!(ReadBufLine::new(b));
 
-        unsafe fn clone(_null: *const ()) -> RawWaker {
-            unimplemented!()
-        }
+    fn expect_parse_result<T: AsRef<[u8]> + Unpin + Debug>(bytes: T, expect: DataTypes) {
+        let s = Cursor::new(bytes);
+        let bytes = futures::io::BufReader::new(s);
+        let mut r = RedisParser::new(bytes);
+        let waker = unsafe { Waker::from_raw(NOOP) };
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(r.parse());
 
-        unsafe fn wake(_null: *const ()) {
-            unimplemented!()
-        }
-
-        unsafe fn wake_by_ref(_null: *const ()) {
-            unimplemented!()
-        }
-
-        unsafe fn drop(_null: *const ()) {}
-
-        let data = ptr::null();
-        let vtable = &RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-        let raw_waker = RawWaker::new(data, vtable);
-        let waker = unsafe { Waker::from_raw(raw_waker) };
-        let mut cx = Context::from_waker(&waker);
-
-        let r = line_buf_read.as_mut().poll(&mut cx);
-        if let Poll::Ready(r) = r {
-            assert_eq!(String::from_utf8(r.unwrap()).unwrap(), "12345");
-        }
-
-        let r = line_buf_read.as_mut().poll(&mut cx);
-        if let Poll::Ready(r) = r {
-            assert_eq!(String::from_utf8(r.unwrap()).unwrap(), "6789");
+        if let Poll::Ready(res) = future.poll_unpin(&mut context) {
+            assert!(res.is_ok(), "r wasn't true, error is: {}", res.unwrap_err());
+            assert_eq!(res.unwrap(), expect);
+        } else {
+            assert!(false, "future was not ready right away");
         }
     }
 
     // // TODO: this was really easy to parse .. but probably want more thorough tests.
     #[test]
     fn test_parse_redis_request_string() {
-        let mut bytes = ReadBufLine::new(b"+hello world\r\n" as &[u8]);
-        let r = parse_redis_datatype_sync(&mut bytes);
-        assert!(r.is_ok(), "r wasn't true, error is: {}", r.unwrap_err());
-        assert_eq!(
-            r.unwrap(),
-            DataTypes::String(String::from("hello world").into())
-        );
+        let s = Cursor::new(b"+hello world\r\n");
+        let bytes = futures::io::BufReader::new(s);
+        let mut r = RedisParser::new(bytes);
+        // use the noop waker
+        let waker = unsafe { Waker::from_raw(NOOP) };
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(r.parse());
+        if let Poll::Ready(res) = future.poll_unpin(&mut context) {
+            assert!(res.is_ok(), "r wasn't true, error is: {}", res.unwrap_err());
+            assert_eq!(
+                res.unwrap(),
+                DataTypes::String(String::from("hello world").into())
+            );
+        } else {
+            assert!(false, "future was not ready right away");
+        }
     }
+
     #[test]
     fn test_parse_redis_array() {
-        let mut bytes =
-            ReadBufLine::new(b"*2\r\n:12345\r\n+hello world this is foo bar\r\n" as &[u8]);
+        expect_parse_result(
+            b"*2\r\n:12345\r\n+hello world this is foo bar\r\n" as &[u8],
+            DataTypes::Array(vec![
+                DataTypes::Int(12345),
+                DataTypes::String(String::from("hello world this is foo bar").into()),
+            ]),
+        );
+    }
+    // //
+    #[test]
+    fn test_parse_redis_request_big_string() {
+        let mut bytes = b"$5\r\nhello\r\n";
+        let expected = DataTypes::String(String::from("hello").into());
+        expect_parse_result(bytes, expected);
+    }
 
-        let r = pin::pin!(parse_redis_datatype(&mut bytes));
+    #[test]
+    fn test_parse_request() {
+        let bytes = "*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n".as_bytes();
+        let s = Cursor::new(bytes);
+        let bytes = futures::io::BufReader::new(s);
+        let mut r = RedisParser::new(bytes);
         let waker = unsafe { Waker::from_raw(NOOP) };
-        let mut cx = Context::from_waker(&waker);
-        let res = r.poll(&mut cx);
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(r.parse());
 
-        if let Poll::Ready(r) = res {
-            if let Ok(DataTypes::Array(a)) = r {
+        if let Poll::Ready(res) = future.poll_unpin(&mut context) {
+            assert!(res.is_ok(), "r wasn't true, error is: {}", res.unwrap_err());
+            if let Ok(DataTypes::Array(a)) = res {
                 assert_eq!(a.len(), 2);
-                assert_eq!(a[0], DataTypes::Int(12345));
-                assert_eq!(
-                    a[1],
-                    DataTypes::String(String::from("hello world this is foo bar").into())
-                );
+                assert_eq!(a[0], DataTypes::String(String::from("ECHO").into()));
+                assert_eq!(a[1], DataTypes::String(String::from("hey").into()));
             } else {
                 assert!(false, "r wasn't an array");
             }
         } else {
-            assert!(false, "poll should be immediately ready")
+            assert!(false, "poll wasn't ready");
         }
     }
-    //
-    #[test]
-    fn test_parse_redis_request_big_string() {
-        let mut bytes = ReadBufLine::new(b"$5\r\nhello\r\n" as &[u8]);
-        let r = pin::pin!(parse_redis_datatype(&mut bytes));
-        let waker = unsafe { Waker::from_raw(NOOP) };
-        let mut cx = Context::from_waker(&waker);
-        let res = r.poll(&mut cx);
-
-        if let Poll::Ready(r) = res {
-            assert!(r.is_ok(), "r wasn't true, error is: {}", r.unwrap_err());
-            assert_eq!(r.unwrap(), DataTypes::String(String::from("hello").into()));
-        } else {
-            assert!(false, "poll should be immediately ready")
-        }
-    }
-    //
-    // #[test]
-    // fn test_parse_request() {
-    //     let bytes = "*2\r\n$4\r\nECHO\r\n$3\r\nhey\r".as_bytes();
-    //     let mut bytes_iter = bytes.bytes();
-    //     let r = parse_redis_datatype(&mut bytes_iter);
-    //     if r.is_err() {
-    //         let e = r.as_ref().unwrap_err();
-    //         let cause = e.as_fail().cause();
-    //         // let bt = e.backtrace();
-    //         println!("cause: {cause:?}");
-    //     }
-    //     assert!(r.is_ok(), "r wasn't true, error is: {}", r.unwrap_err());
-    //     if let Ok(DataTypes::Array(a)) = r {
-    //         assert_eq!(a.len(), 2);
-    //         assert_eq!(a[0], DataTypes::String(String::from("ECHO").into()));
-    //         assert_eq!(a[1], DataTypes::String(String::from("hey").into()));
-    //     } else {
-    //         assert!(false, "r wasn't an array");
-    //     }
-    // }
 }
