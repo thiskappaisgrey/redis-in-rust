@@ -2,13 +2,15 @@
 name = "redis-rust"
 version = "0.1.0"
 edition = "2021"
+default-run = "server"
 
-[[bin]]
-name = "server"
-test = false
 
 [dependencies]
 anyhow = "1.0.94"
 futures = "0.3.31"
+opentelemetry = "0.27.1"
+opentelemetry-stdout = "0.27.0"
+opentelemetry_sdk = "0.27.1"
+rustix = {version= "0.38.42", features=["event"]}
 tracing = "0.1.41"
 tracing-subscriber = { version= "0.3.19", features = ["fmt", "registry", "std"]}
