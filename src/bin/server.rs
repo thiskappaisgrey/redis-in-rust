@@ -38,7 +38,7 @@ async fn handle_client(stream: TcpStream) -> Result<(), Error> {
         //     //
         match command {
             redis_rust::redis::Command::Ping => {
-                write_stream.write_all("$4\r\nPONG\r\n".as_bytes()).await;
+                write_stream.write_all("$4\r\nPONG\r\n".as_bytes()).await?;
                 write_stream.flush().await?;
             }
             redis_rust::redis::Command::Echo(e) => {}
