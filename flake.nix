@@ -8,7 +8,25 @@
 
   outputs = { self, nixpkgs, rust-overlay }:
     let
-      overlays = [ (import rust-overlay) ];
+      overlays = [
+        (import rust-overlay)
+        (final: prev: {
+          cargo-valgrind = prev.cargo-valgrind.overrideAttrs rec {
+            version = "main";
+            src = prev.fetchFromGitHub {
+              owner = "jfrimmel";
+              repo = "cargo-valgrind";
+              rev = "710756bb458bebc3637816d13df051ef2a10d5fe";
+              sha256 = "sha256-uZmBMDvizwr2r4Ed4JqphmGsz4DJZ2vCGAA/I9kC3OA=";
+            };
+            cargoDeps = prev.rustPlatform.fetchCargoTarball ({
+              inherit src;
+              hash = "sha256-4/g/FTuUFX5wEqGl0Y21fJrOL49uapE5fUbJsEhaR4Y=";
+            });
+            doCheck = false;
+          };
+        })
+      ];
       forAllSystems = function:
         nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ]
         (system: function (import nixpkgs { inherit system overlays; }));
@@ -32,8 +50,11 @@
               # Not sure what language I prefer yet .. but probably julia > janet (I'm not a real lisper)
               janet
               julia
+              valgrind
+              just
 
               toolchain
+              cargo-valgrind
             ];
 
             # This is needed or LSP won't work corretly
