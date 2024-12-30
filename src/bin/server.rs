@@ -3,7 +3,7 @@ use futures::io::{BufReader, BufWriter};
 use futures::{executor, AsyncWriteExt};
 use redis_rust::executor::new_executor_and_spawner;
 use redis_rust::reactor;
-use redis_rust::redis::RedisParser;
+use redis_rust::redis::{DataTypes, RedisParser};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::AsFd;
 use std::thread;
@@ -29,19 +29,23 @@ async fn handle_client(stream: TcpStream) -> Result<(), Error> {
     // while there's data in the buffer
     loop {
         let r = parser.parse().await?;
-        let command = redis_rust::redis::into_command(&r)?;
-        //     // parse more commands
-        //     info!("Calling parse");
-        //     // TODO: we have to poll this until completion
-        //     // I wonder what completion means ..
-        //     // let d = redis_rust::redis::parse_redis_datatype(&mut readbufline).await?;
-        //     //
+        if r.is_none() {
+            break;
+        }
+        // TODO: it'd be nice to have request metrics here using OpenTelemetry
+
+        let command = redis_rust::redis::into_command(&r.unwrap())?;
         match command {
             redis_rust::redis::Command::Ping => {
                 write_stream.write_all("$4\r\nPONG\r\n".as_bytes()).await?;
                 write_stream.flush().await?;
             }
-            redis_rust::redis::Command::Echo(e) => {}
+            redis_rust::redis::Command::Echo(e) => {
+                let resp = DataTypes::String(e);
+                let resp_str: String = resp.into();
+                write_stream.write_all(resp_str.as_bytes()).await?;
+                write_stream.flush().await?;
+            }
         }
     }
 

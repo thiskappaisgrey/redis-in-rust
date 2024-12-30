@@ -1,20 +1,12 @@
 use anyhow::{format_err, Error};
-use futures::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
+use futures::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::{
-    borrow::{Borrow, BorrowMut},
-    fmt::Debug,
-    future::{Future, Ready},
-    io::{self, BufRead, BufReader, Bytes, Write},
-    os::fd::{AsFd, BorrowedFd},
-    pin::{self, Pin},
+    fmt::{Debug, Write},
+    io::{self},
     ptr,
-    rc::Rc,
     sync::Arc,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{RawWaker, RawWakerVTable},
 };
-use tracing::info;
-
-use crate::reactor::reactor;
 
 // TODO: I will probably have to end up giving lifetime params here
 #[derive(Debug, PartialEq)]
@@ -34,10 +26,35 @@ pub enum DataTypes {
     // TODO: Support more complex data tyeps in Redis
 }
 
+impl From<&DataTypes> for String {
+    fn from(value: &DataTypes) -> Self {
+        match value {
+            DataTypes::String(s) => format!("${}\r\n{}\r\n", s.len(), s),
+            DataTypes::Array(a) => {
+                let mut s = String::new();
+                write!(s, "*{}\r\n", a.len()).unwrap();
+                for d in a {
+                    write!(s, "{}", Into::<String>::into(d)).unwrap();
+                }
+                s
+            }
+            DataTypes::Int(i) => {
+                format!(":{}", i)
+            }
+            _ => todo!(),
+        }
+    }
+}
+impl From<DataTypes> for String {
+    fn from(value: DataTypes) -> Self {
+        (&value).into()
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Ping,
-    Echo(Arc<str>), // TODO: prob want to use a better type here..
+    Echo(Arc<str>),
 }
 
 // NOOP waker from the stdlib unstable feature
@@ -69,34 +86,34 @@ impl<T: AsyncBufRead + Unpin> RedisParser<T> {
         }
     }
     // we can have async methods in traits!
-    pub async fn parse(&mut self) -> Result<DataTypes, Error> {
+    pub async fn parse(&mut self) -> Result<Option<DataTypes>, Error> {
         // clear the buffer before each parse
         self.buf.clear();
 
         let _s = self.bufread.read_until(b'\r', &mut self.buf).await?;
         self.buf.pop(); // pop the b'\r' b/c we want inclusive
 
-        let utf8 = std::str::from_utf8(self.buf.as_slice())?;
         let mut bytes_iter = self.buf.iter();
         if let Some(b'\n') = bytes_iter.clone().peekable().peek() {
             bytes_iter.next();
         }
 
-        // TODO: if I just have a special error type here..
-        let first = bytes_iter.next().ok_or(format_err!("No first byte"))?;
+        let first = bytes_iter.next();
+        if first.is_none() {
+            return Ok(None);
+        }
 
-        match first {
+        match first.unwrap() {
             b'+' => {
                 let s: &[u8] = bytes_iter.as_slice();
                 let utf8 = std::str::from_utf8(s)?;
-                Ok(DataTypes::String(utf8.into()))
+                Ok(Some(DataTypes::String(utf8.into())))
             }
             b':' => {
                 let x = bytes_iter.as_slice();
                 let utf8 = std::str::from_utf8(x)?;
-                println!("Utf8 is: {}.", utf8);
                 let num = str::parse(utf8).map_err(|_e| format_err!("invalid digit: {}", utf8))?;
-                Ok(DataTypes::Int(num))
+                Ok(Some(DataTypes::Int(num)))
             }
             b'$' => {
                 let len_str = std::str::from_utf8(bytes_iter.as_slice())?;
@@ -115,29 +132,30 @@ impl<T: AsyncBufRead + Unpin> RedisParser<T> {
                 let e = self.bufread.read_exact(&mut buf).await;
                 if let Err(er) = e {
                     // try to read the \r\n
-                    // but we aren't concernted
+                    // but we aren't concerned if the stream ended
                     if er.kind() != io::ErrorKind::UnexpectedEof {
                         return Err(er.into());
                     }
                 }
 
-                Ok(DataTypes::String(utf8))
+                Ok(Some(DataTypes::String(utf8)))
             }
             b'*' => {
-                println!("Array");
-                let len_str = std::str::from_utf8(&bytes_iter.as_slice())?;
-                println!("utf8: {len_str}");
-                let len = u64::from_str_radix(&len_str, 10)
+                let len_str = std::str::from_utf8(bytes_iter.as_slice())?;
+                let len = len_str
+                    .parse()
                     .map_err(|_e| format_err!("Invalid digit: {len_str}."))?;
                 // Allocate a new datatype vector for the array
                 let mut v = Vec::with_capacity(len as usize);
 
-                for _ in 0..len {
-                    let d = Box::pin(self.parse()).await?;
-                    println!("parsed: {d:?}");
+                for i in 0..len {
+                    let d = Box::pin(self.parse()).await?.ok_or(format_err!(
+                        "Partial array parse. Expected {len} items, but got: {i}."
+                    ))?;
                     v.push(d);
                 }
-                Ok(DataTypes::Array(v))
+
+                Ok(Some(DataTypes::Array(v)))
             }
             b => Err(format_err!("Invalid datatype specifier: {}", *b as char)),
         }
@@ -154,7 +172,6 @@ pub fn into_command(d: &DataTypes) -> Result<Command, Error> {
                     "ECHO" => {
                         let arg = v.get(1).ok_or(format_err!("Expected ECHO argument"))?;
                         if let DataTypes::String(s) = arg {
-                            // TODO: this clones the string, which is not great
                             Ok(Command::Echo(s.clone()))
                         } else {
                             Err(format_err!("Echo argument not a string"))
@@ -172,15 +189,6 @@ pub fn into_command(d: &DataTypes) -> Result<Command, Error> {
     }
 }
 
-// turn a datatype into bytes
-pub fn into_bytes<W>(d: DataTypes, writer: &mut W) -> Result<(), Error>
-where
-    W: Write,
-{
-    // Ok(())
-    todo!()
-}
-
 #[cfg(test)]
 mod test {
     use futures::{future::Ready, io::Cursor, FutureExt};
@@ -190,8 +198,11 @@ mod test {
     };
 
     use super::*;
-
-    fn expect_parse_result<T: AsRef<[u8]> + Unpin + Debug>(bytes: T, expect: DataTypes) {
+    fn run_parse_future<T, F>(bytes: T, f: F)
+    where
+        F: Fn(Result<Option<DataTypes>, Error>),
+        T: AsRef<[u8]> + Unpin + Debug,
+    {
         let s = Cursor::new(bytes);
         let bytes = futures::io::BufReader::new(s);
         let mut r = RedisParser::new(bytes);
@@ -200,11 +211,17 @@ mod test {
         let mut future = Box::pin(r.parse());
 
         if let Poll::Ready(res) = future.poll_unpin(&mut context) {
-            assert!(res.is_ok(), "r wasn't true, error is: {}", res.unwrap_err());
-            assert_eq!(res.unwrap(), expect);
+            f(res);
         } else {
-            assert!(false, "future was not ready right away");
+            panic!("future was not ready right away");
         }
+    }
+
+    fn expect_parse_result<T: AsRef<[u8]> + Unpin + Debug>(bytes: T, expect: DataTypes) {
+        run_parse_future(bytes, |res| {
+            assert!(res.is_ok(), "r wasn't true, error is: {}", res.unwrap_err());
+            assert_eq!(res.unwrap().unwrap(), expect);
+        });
     }
 
     // // TODO: this was really easy to parse .. but probably want more thorough tests.
@@ -220,7 +237,7 @@ mod test {
         if let Poll::Ready(res) = future.poll_unpin(&mut context) {
             assert!(res.is_ok(), "r wasn't true, error is: {}", res.unwrap_err());
             assert_eq!(
-                res.unwrap(),
+                res.unwrap().unwrap(),
                 DataTypes::String(String::from("hello world").into())
             );
         } else {
@@ -258,7 +275,7 @@ mod test {
 
         if let Poll::Ready(res) = future.poll_unpin(&mut context) {
             assert!(res.is_ok(), "r wasn't true, error is: {}", res.unwrap_err());
-            if let Ok(DataTypes::Array(a)) = res {
+            if let Ok(Some(DataTypes::Array(a))) = res {
                 assert_eq!(a.len(), 2);
                 assert_eq!(a[0], DataTypes::String(String::from("ECHO").into()));
                 assert_eq!(a[1], DataTypes::String(String::from("hey").into()));
@@ -268,5 +285,16 @@ mod test {
         } else {
             assert!(false, "poll wasn't ready");
         }
+    }
+
+    #[test]
+    fn test_format() {
+        let bytes = "*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n".as_bytes();
+        run_parse_future(bytes, |r| {
+            let res = r.unwrap().unwrap();
+            let st: String = res.into();
+            let nbytes = st.as_bytes();
+            assert_eq!(bytes, nbytes);
+        });
     }
 }
